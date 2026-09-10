@@ -1,0 +1,193 @@
+name: Terraform PR Plan
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+jobs:
+  up-to-date:
+    name: Branch up to date
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Require latest target branch
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags origin "${BASE_REF}"
+          base_sha="$(git rev-parse FETCH_HEAD)"
+
+          if ! git merge-base --is-ancestor "${base_sha}" "${HEAD_SHA}"; then
+            echo "The PR branch does not contain the latest ${BASE_REF}." >&2
+            echo "Update the branch before Terraform validation and planning." >&2
+            exit 1
+          fi
+
+  validate:
+    name: Validate infrastructure
+    needs: up-to-date
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.0
+
+      - name: Set up TFLint
+        uses: terraform-linters/setup-tflint@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@v0.2.4
+
+      - name: Set up Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Run Terraform and policy checks
+        run: ./technicalTest/scripts/validate.sh all
+
+  plan:
+    name: Plan ${{ matrix.environment }}
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ format('{0}-plan', matrix.environment) }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - dev
+          - staging
+          - prod
+
+    env:
+      TF_VAR_project_name: ${{ vars.PROJECT_NAME || 'webservice' }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_dr_region: ${{ vars.DR_REGION }}
+      TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+      TF_VAR_hosted_zone_id: ${{ vars.HOSTED_ZONE_ID }}
+      TF_VAR_container_image: ${{ vars.CONTAINER_IMAGE }}
+      TF_VAR_activate_dns: ${{ vars.ACTIVATE_DNS || 'true' }}
+      TF_VAR_container_port: ${{ vars.CONTAINER_PORT || '8080' }}
+      TF_VAR_health_check_path: ${{ vars.HEALTH_CHECK_PATH || '/health' }}
+      TF_VAR_database_snapshot_identifier: ${{ vars.DATABASE_SNAPSHOT_IDENTIFIER || 'null' }}
+      TF_VAR_allowed_ingress_cidrs: ${{ vars.ALLOWED_INGRESS_CIDRS || '["0.0.0.0/0"]' }}
+      TF_VAR_allowed_https_egress_cidrs: ${{ vars.ALLOWED_HTTPS_EGRESS_CIDRS || '[]' }}
+      TF_VAR_alarm_email: ${{ vars.ALARM_EMAIL || 'null' }}
+      TF_VAR_additional_tags: ${{ vars.ADDITIONAL_TAGS || '{}' }}
+
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate GitHub configuration
+        env:
+          AWS_PLAN_ROLE_ARN: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          DR_REGION: ${{ vars.DR_REGION }}
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID }}
+          CONTAINER_IMAGE: ${{ vars.CONTAINER_IMAGE }}
+          STATE_BUCKET_NAME: ${{ vars.STATE_BUCKET_NAME }}
+          STATE_KMS_KEY_ARN: ${{ vars.STATE_KMS_KEY_ARN }}
+        run: |
+          missing=0
+          for variable_name in \
+            AWS_PLAN_ROLE_ARN \
+            AWS_REGION \
+            DR_REGION \
+            DOMAIN_NAME \
+            HOSTED_ZONE_ID \
+            CONTAINER_IMAGE \
+            STATE_BUCKET_NAME \
+            STATE_KMS_KEY_ARN; do
+            if [[ -z "${!variable_name}" ]]; then
+              echo "::error::Missing GitHub variable: ${variable_name}"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Initialize backend
+        working-directory: technicalTest/environments/${{ matrix.environment }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="kms_key_id=${{ vars.STATE_KMS_KEY_ARN }}"
+
+      - name: Create saved plan
+        working-directory: technicalTest/environments/${{ matrix.environment }}
+        run: |
+          terraform plan -lock-timeout=5m -out=tfplan
+          terraform show -no-color tfplan > tfplan.txt
+
+      - name: Record plan metadata
+        working-directory: technicalTest/environments/${{ matrix.environment }}
+        run: |
+          printf 'environment=%s\nhead_sha=%s\n' \
+            '${{ matrix.environment }}' \
+            '${{ github.event.pull_request.head.sha }}' > plan-metadata.txt
+
+      - name: Upload saved plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            technicalTest/environments/${{ matrix.environment }}/tfplan
+            technicalTest/environments/${{ matrix.environment }}/tfplan.txt
+            technicalTest/environments/${{ matrix.environment }}/plan-metadata.txt
+          if-no-files-found: error
+          retention-days: 1

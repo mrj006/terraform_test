@@ -1,0 +1,173 @@
+name: Terraform Merge Apply
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+  pull-requests: read
+
+concurrency:
+  group: terraform-apply-main
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+jobs:
+  resolve-plan:
+    name: Resolve reviewed plan
+    runs-on: ubuntu-latest
+
+    outputs:
+      plan-run-id: ${{ steps.plan-run.outputs.run-id }}
+      head-sha: ${{ steps.pull-request.outputs.head-sha }}
+      merge-sha: ${{ github.sha }}
+
+    steps:
+      - name: Check out merged revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve merged pull request
+        id: pull-request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          pull_requests="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/pulls")"
+
+          pull_request="$(jq -c --arg merge_sha "${MERGE_SHA}" \
+            '[.[] | select(
+              .merged_at != null and
+              .base.ref == "main" and
+              .merge_commit_sha == $merge_sha
+            )] | sort_by(.merged_at) | last // empty' \
+            <<<"${pull_requests}")"
+
+          if [[ -z "${pull_request}" ]]; then
+            echo "No merged pull request is associated with ${MERGE_SHA}." >&2
+            echo "Direct pushes to main cannot be applied without reviewed plans." >&2
+            exit 1
+          fi
+
+          echo "number=$(jq -r '.number' <<<"${pull_request}")" >> "${GITHUB_OUTPUT}"
+          echo "head-sha=$(jq -r '.head.sha' <<<"${pull_request}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify merged Terraform matches PR head
+        env:
+          HEAD_SHA: ${{ steps.pull-request.outputs.head-sha }}
+          MERGE_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ steps.pull-request.outputs.number }}
+        run: |
+          git fetch --no-tags origin "pull/${PR_NUMBER}/head"
+          test "$(git rev-parse FETCH_HEAD)" = "${HEAD_SHA}"
+
+          if ! git diff --quiet "${HEAD_SHA}" "${MERGE_SHA}" -- technicalTest; then
+            echo "The merged technicalTest tree differs from the planned PR head." >&2
+            echo "Update the PR branch and regenerate plans before merging." >&2
+            exit 1
+          fi
+
+      - name: Find successful PR plan run
+        id: plan-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pull-request.outputs.head-sha }}
+        run: |
+          run_data="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/terraform-pr-plan.yml/runs" \
+            -f event=pull_request \
+            -f head_sha="${HEAD_SHA}" \
+            -f status=completed \
+            -f per_page=100)"
+
+          run_id="$(jq -r '.workflow_runs[0].id // empty' <<<"${run_data}")"
+          conclusion="$(jq -r '.workflow_runs[0].conclusion // empty' <<<"${run_data}")"
+
+          if [[ -z "${run_id}" || "${conclusion}" != "success" ]]; then
+            echo "The latest PR workflow for ${HEAD_SHA} did not complete successfully." >&2
+            exit 1
+          fi
+
+          artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts")"
+          for environment_name in dev staging prod; do
+            artifact_name="tfplan-${environment_name}-${HEAD_SHA}"
+            if ! jq -e --arg name "${artifact_name}" \
+              '.artifacts | any(.name == $name and .expired == false)' \
+              <<<"${artifacts}" >/dev/null; then
+              echo "Missing unexpired artifact: ${artifact_name}" >&2
+              exit 1
+            fi
+          done
+
+          echo "run-id=${run_id}" >> "${GITHUB_OUTPUT}"
+
+  apply:
+    name: Apply ${{ matrix.environment }}
+    needs: resolve-plan
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        environment:
+          - dev
+          - staging
+          - prod
+
+    steps:
+      - name: Check out merged revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-plan.outputs.merge-sha }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Download reviewed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}-${{ needs.resolve-plan.outputs.head-sha }}
+          path: plan-artifact
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.resolve-plan.outputs.plan-run-id }}
+
+      - name: Verify plan metadata
+        env:
+          ENVIRONMENT_NAME: ${{ matrix.environment }}
+          HEAD_SHA: ${{ needs.resolve-plan.outputs.head-sha }}
+        run: |
+          grep -Fx "environment=${ENVIRONMENT_NAME}" plan-artifact/plan-metadata.txt
+          grep -Fx "head_sha=${HEAD_SHA}" plan-artifact/plan-metadata.txt
+
+      - name: Initialize backend
+        working-directory: technicalTest/environments/${{ matrix.environment }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="kms_key_id=${{ vars.STATE_KMS_KEY_ARN }}"
+
+      - name: Apply reviewed plan
+        working-directory: technicalTest/environments/${{ matrix.environment }}
+        run: terraform apply -auto-approve "${GITHUB_WORKSPACE}/plan-artifact/tfplan"

@@ -1,0 +1,14 @@
+project_name                 = "webservice"
+aws_region                   = "us-east-1"
+dr_region                    = "us-west-2"
+domain_name                  = "www.example.com"
+hosted_zone_id               = "REPLACE_WITH_ROUTE53_ZONE_ID"
+container_image              = "REPLACE_WITH_IMMUTABLE_ARM64_IMAGE_URI"
+activate_dns                 = true
+container_port               = 8080
+health_check_path            = "/health"
+database_snapshot_identifier = null
+allowed_ingress_cidrs        = ["0.0.0.0/0"]
+allowed_https_egress_cidrs   = []
+alarm_email                  = null
+additional_tags              = {}
